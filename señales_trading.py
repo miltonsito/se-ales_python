@@ -27,7 +27,10 @@ HORA_INICIO = 6
 HORA_FIN = 22     
 ultimo_reporte_fecha = None
 
-# Lista de símbolos optimizada para volumen
+# Configuración de Riesgo
+MAX_OPERACIONES_SIMULTANEAS = 5  # <--- Límite de 5 activos a la vez
+CHECK_EVERY_SECONDS = 20         # Escaneo más rápido para 150 monedas
+
 SYMBOLS = ["BTC/USDT","ETH/USDT","BNB/USDT","XRP/USDT","SOL/USDT","ADA/USDT","DOGE/USDT","TRX/USDT","AVAX/USDT","DOT/USDT",
     "MATIC/USDT","LINK/USDT","LTC/USDT","BCH/USDT","XLM/USDT","ATOM/USDT","ICP/USDT","FIL/USDT","APT/USDT","ARB/USDT",
     "OP/USDT","NEAR/USDT","VET/USDT","HBAR/USDT","EGLD/USDT","XTZ/USDT","EOS/USDT","SAND/USDT","MANA/USDT","AAVE/USDT",
@@ -54,7 +57,6 @@ SYMBOLS = ["BTC/USDT","ETH/USDT","BNB/USDT","XRP/USDT","SOL/USDT","ADA/USDT","DO
 
 TIMEFRAME = "5m"
 LIMIT = 320
-CHECK_EVERY_SECONDS = 30
 COOLDOWN_MINUTES = 60
 ENTRY_WINDOW_PCT = 0.003
 
@@ -96,62 +98,51 @@ def append_history_row(row: dict) -> None:
         f.write(",".join(str(row.get(k, "")) for k in header) + "\n")
 
 # =========================
-# LÓGICA DE ULTRA-PRECISIÓN (INTEGRADA)
+# LÓGICA DE ULTRA-PRECISIÓN
 # =========================
 def generate_signal(df: pd.DataFrame) -> Optional[Signal]:
     if len(df) < 210: return None
-
     df = df.copy()
-    # Indicadores de alta precisión
     df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
     df["sma20"] = df["close"].rolling(window=20).mean()
     df["std"] = df["close"].rolling(window=20).std()
-    df["upper"] = df["sma20"] + (2.5 * df["std"]) # BB 2.5 para extremos
+    df["upper"] = df["sma20"] + (2.5 * df["std"])
     df["lower"] = df["sma20"] - (2.5 * df["std"])
 
-    # RSI de 7 periodos (más sensible para scalping)
     delta = df["close"].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=7).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=7).mean()
     df["rsi"] = 100 - (100 / (1 + (gain / loss)))
 
     curr = df.iloc[-1]
-    
-    # Cálculo de velas y mechas
     body = abs(curr["close"] - curr["open"])
     lower_wick = min(curr["open"], curr["close"]) - curr["low"]
     upper_wick = curr["high"] - max(curr["open"], curr["close"])
     
     side, prob = None, 0.0
 
-    # --- FILTRO 1: COMPRA (LONG) ---
-    # Solo si el precio está por encima de la EMA 200 (Tendencia Alcista)
     if curr["close"] > curr["ema200"]:
         if curr["low"] < curr["lower"] and curr["rsi"] < 18:
-            if lower_wick > (body * 2): # Confirmación de rechazo fuerte
+            if lower_wick > (body * 2):
                 side, prob = "BUY", 92.0
                 entry = curr["close"]
-                tp, sl = entry * 1.008, entry * 0.980 # TP 0.8%, SL 2.0%
+                tp, sl = entry * 1.008, entry * 0.980
 
-    # --- FILTRO 2: VENTA (SHORT) ---
-    # Solo si el precio está por debajo de la EMA 200 (Tendencia Bajista)
     elif curr["close"] < curr["ema200"]:
         if curr["high"] > curr["upper"] and curr["rsi"] > 82:
-            if upper_wick > (body * 2): # Confirmación de rechazo fuerte
+            if upper_wick > (body * 2):
                 side, prob = "SELL", 92.0
                 entry = curr["close"]
-                tp, sl = entry * 0.992, entry * 1.020 # TP 0.8%, SL 2.0%
+                tp, sl = entry * 0.992, entry * 1.020
 
     if side:
-        return Signal(
-            side=side, entry=entry, sl=sl, tp=tp, probability=prob,
-            trigger="ULTRA_PRECISION", reason="Trend+Extremes+WickRejection",
-            timestamp_ms=int(curr["timestamp"].timestamp() * 1000)
-        )
+        return Signal(side=side, entry=entry, sl=sl, tp=tp, probability=prob,
+                      trigger="ULTRA_PRECISION", reason="Trend+Extremes+WickRejection",
+                      timestamp_ms=int(curr["timestamp"].timestamp() * 1000))
     return None
 
 # =========================
-# EXCHANGE TOOLS & TELEGRAM
+# EXCHANGE & TOOLS
 # =========================
 def build_exchange():
     ex = ccxt.binanceusdm({"enableRateLimit": True})
@@ -183,8 +174,9 @@ def render_chart(df: pd.DataFrame, signal: Signal, symbol: str, out_path: str) -
     mpf.plot(df_c, type="candle", style="binance", addplot=ap, savefig=out_path, tight_layout=True)
     return out_path
 
-async def send_telegram(bot: Bot, signal: Signal, chart_path: str, symbol: str) -> None:
-    msg = (f"🎯 **SEÑAL DE ALTA PRECISIÓN**\n\n📊 Activo: {symbol}\n🟦 Operación: {signal.side}\n"
+async def send_telegram(bot: Bot, signal: Signal, chart_path: str, symbol: str, cupos_info: str) -> None:
+    msg = (f"🎯 **SEÑAL DE ALTA PRECISIÓN**\n{cupos_info}\n\n"
+           f"📊 Activo: {symbol}\n🟦 Operación: {signal.side}\n"
            f"💰 Entrada: {signal.entry:.6f}\n✅ TP: {signal.tp:.6f} (+0.80%)\n"
            f"🛑 SL: {signal.sl:.6f} (-2.00%)\n⚡ Confianza: {signal.probability}%")
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
@@ -195,8 +187,15 @@ async def track_open_trades(exchange: ccxt.Exchange, bot: Bot, open_trades: dict
     to_close = []
     for symbol, t in list(open_trades.items()):
         try:
+            # Alerta de zona superada
             ticker = exchange.fetch_ticker(symbol)
             curr_p = ticker["last"]
+            diff = (curr_p - t["entry"]) / t["entry"]
+            if t.get("status") == "OPEN":
+                if (t["side"] == "BUY" and diff > ENTRY_WINDOW_PCT) or (t["side"] == "SELL" and diff < -ENTRY_WINDOW_PCT):
+                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⚠️ {symbol}: ZONA SUPERADA. No entrar.")
+                    open_trades[symbol]["status"] = "EXPIRED"
+
             hit = None
             if t["side"] == "BUY":
                 if curr_p <= t["sl"]: hit = "SL"
@@ -210,7 +209,7 @@ async def track_open_trades(exchange: ccxt.Exchange, bot: Bot, open_trades: dict
                 append_history_row({
                     "closed_at_utc": _utc_now_str(), "symbol": symbol, "side": t["side"],
                     "entry": t["entry"], "sl": t["sl"], "tp": t["tp"], "result": hit,
-                    "pnl_pct": pnl, "probability": t.get("probability", 92), "trigger": t.get("trigger", "UP")
+                    "pnl_pct": pnl, "probability": 92.0, "trigger": "ULTRA"
                 })
                 to_close.append(symbol)
                 await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🏁 **{symbol} Cerrado en {hit}** ({pnl}%)")
@@ -218,9 +217,6 @@ async def track_open_trades(exchange: ccxt.Exchange, bot: Bot, open_trades: dict
     for s in to_close: open_trades.pop(s, None)
     if to_close: save_open_trades(open_trades)
 
-# =========================
-# REPORTE DIARIO (ZONA ARG)
-# =========================
 async def enviar_reporte_diario(bot: Bot):
     if not os.path.exists(HISTORY_CSV): return
     try:
@@ -229,7 +225,6 @@ async def enviar_reporte_diario(bot: Bot):
         df_h["fecha_arg"] = df_h["closed_at_utc_dt"].dt.tz_convert(TZ_ARG).dt.date
         hoy_arg = datetime.now(TZ_ARG).date()
         df_hoy = df_h[df_h["fecha_arg"] == hoy_arg]
-
         if not df_hoy.empty:
             total, wins = len(df_hoy), len(df_hoy[df_hoy["result"] == "TP"])
             pnl = df_hoy["pnl_pct"].sum()
@@ -245,7 +240,7 @@ async def main():
     global ultimo_reporte_fecha
     exchange = build_exchange()
     bot = Bot(token=TELEGRAM_TOKEN)
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot francotirador iniciado (6 AM - 10 PM ARG)")
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🚀 Bot francotirador iniciado (Límite: {MAX_OPERACIONES_SIMULTANEAS} activos)")
     
     symbols_ok = [normalize_symbol(exchange, s) for s in SYMBOLS if normalize_symbol(exchange, s) in exchange.symbols]
     last_sent_ts = {}
@@ -258,22 +253,31 @@ async def main():
         await track_open_trades(exchange, bot, open_trades)
 
         if HORA_INICIO <= hora < HORA_FIN:
-            print(f"[{ahora_arg.strftime('%H:%M:%S')}] Escaneando mercados...")
-            for symbol in symbols_ok:
-                try:
-                    df = fetch_ohlcv(exchange, symbol, TIMEFRAME, 250)
-                    signal = generate_signal(df)
-                    if signal:
-                        now_t = time.time()
-                        if (now_t - last_sent_ts.get(symbol, 0)) > COOLDOWN_MINUTES * 60:
-                            path = f"chart_{symbol.replace('/', '_').replace(':', '_')}.png"
-                            render_chart(df, signal, symbol, path)
-                            await send_telegram(bot, signal, path, symbol)
-                            last_sent_ts[symbol] = now_t
-                            open_trades[symbol] = {"side": signal.side, "entry": signal.entry, "tp": signal.tp, "sl": signal.sl, "status": "OPEN", "probability": signal.probability, "trigger": signal.trigger}
-                            save_open_trades(open_trades)
-                except: pass
-        
+            cantidad_abiertas = len(open_trades)
+            if cantidad_abiertas < MAX_OPERACIONES_SIMULTANEAS:
+                print(f"[{ahora_arg.strftime('%H:%M:%S')}] Escaneando... ({cantidad_abiertas}/{MAX_OPERACIONES_SIMULTANEAS})")
+                for symbol in symbols_ok:
+                    if len(open_trades) >= MAX_OPERACIONES_SIMULTANEAS: break
+                    try:
+                        df = fetch_ohlcv(exchange, symbol, TIMEFRAME, 250)
+                        signal = generate_signal(df)
+                        if signal:
+                            now_t = time.time()
+                            if (now_t - last_sent_ts.get(symbol, 0)) > COOLDOWN_MINUTES * 60:
+                                path = f"chart_{symbol.replace('/', '_').replace(':', '_')}.png"
+                                render_chart(df, signal, symbol, path)
+                                
+                                # Info de cupos para el mensaje
+                                info_cupos = f"📌 Cupos: {len(open_trades) + 1}/{MAX_OPERACIONES_SIMULTANEAS}"
+                                await send_telegram(bot, signal, path, symbol, info_cupos)
+                                
+                                last_sent_ts[symbol] = now_t
+                                open_trades[symbol] = {"side": signal.side, "entry": signal.entry, "tp": signal.tp, "sl": signal.sl, "status": "OPEN"}
+                                save_open_trades(open_trades)
+                    except: pass
+            else:
+                if ahora_arg.second % 60 < 20: print(f"⚠️ Límite alcanzado ({MAX_OPERACIONES_SIMULTANEAS}/5).")
+
         elif hora >= HORA_FIN and ultimo_reporte_fecha != fecha_hoy:
             await enviar_reporte_diario(bot)
             ultimo_reporte_fecha = fecha_hoy
