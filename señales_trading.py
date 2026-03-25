@@ -185,17 +185,27 @@ async def send_telegram(bot: Bot, signal: Signal, chart_path: str, symbol: str, 
 async def track_open_trades(exchange: ccxt.Exchange, bot: Bot, open_trades: dict) -> None:
     if not open_trades: return
     to_close = []
+    cambio_en_json = False # Bandera para saber si guardar cambios
+
     for symbol, t in list(open_trades.items()):
         try:
-            # Alerta de zona superada
             ticker = exchange.fetch_ticker(symbol)
             curr_p = ticker["last"]
-            diff = (curr_p - t["entry"]) / t["entry"]
+            
+            # --- CORRECCIÓN AQUÍ: Evitar el bucle de spam ---
             if t.get("status") == "OPEN":
+                diff = (curr_p - t["entry"]) / t["entry"]
+                
+                # Si se escapa la zona, avisamos UNA SOLA VEZ y cambiamos el status
                 if (t["side"] == "BUY" and diff > ENTRY_WINDOW_PCT) or (t["side"] == "SELL" and diff < -ENTRY_WINDOW_PCT):
-                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⚠️ {symbol}: ZONA SUPERADA. No entrar.")
-                    open_trades[symbol]["status"] = "EXPIRED"
+                    try:
+                        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⚠️ {symbol}: ZONA SUPERADA. No entrar.")
+                    except: pass
+                    
+                    open_trades[symbol]["status"] = "EXPIRED" # Cambiamos status para que no entre más aquí
+                    cambio_en_json = True 
 
+            # Lógica de TP y SL (Sigue igual)
             hit = None
             if t["side"] == "BUY":
                 if curr_p <= t["sl"]: hit = "SL"
@@ -213,9 +223,18 @@ async def track_open_trades(exchange: ccxt.Exchange, bot: Bot, open_trades: dict
                 })
                 to_close.append(symbol)
                 await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🏁 **{symbol} Cerrado en {hit}** ({pnl}%)")
+                cambio_en_json = True
         except: pass
-    for s in to_close: open_trades.pop(s, None)
-    if to_close: save_open_trades(open_trades)
+
+    # Limpiar cerrados
+    for s in to_close:
+        if s in open_trades:
+            open_trades.pop(s)
+            cambio_en_json = True
+
+    # Guardar solo si hubo cambios reales (Cierre o Expiración)
+    if cambio_en_json:
+        save_open_trades(open_trades)
 
 async def enviar_reporte_diario(bot: Bot):
     if not os.path.exists(HISTORY_CSV): return
