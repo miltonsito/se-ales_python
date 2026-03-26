@@ -103,41 +103,58 @@ def append_history_row(row: dict) -> None:
 def generate_signal(df: pd.DataFrame) -> Optional[Signal]:
     if len(df) < 210: return None
     df = df.copy()
+    
+    # Indicadores Base
     df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
     df["sma20"] = df["close"].rolling(window=20).mean()
     df["std"] = df["close"].rolling(window=20).std()
-    df["upper"] = df["sma20"] + (2.5 * df["std"])
-    df["lower"] = df["sma20"] - (2.5 * df["std"])
-
+    df["upper"] = df["sma20"] + (3.0 * df["std"]) # <--- Subimos a 3.0 para detectar EXTREMOS
+    df["lower"] = df["sma20"] - (3.0 * df["std"])
+    
+    # Volumen Relativo (Clave para efectividad)
+    df["vol_avg"] = df["volume"].rolling(window=15).mean()
+    
+    # RSI ultra-sensible
     delta = df["close"].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=7).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=7).mean()
     df["rsi"] = 100 - (100 / (1 + (gain / loss)))
 
     curr = df.iloc[-1]
+    prev = df.iloc[-2] # Miramos la vela anterior para confirmar
+    
     body = abs(curr["close"] - curr["open"])
     lower_wick = min(curr["open"], curr["close"]) - curr["low"]
     upper_wick = curr["high"] - max(curr["open"], curr["close"])
     
     side, prob = None, 0.0
 
+    # --- ESTRATEGIA SNIPER LONG ---
+    # 1. Tendencia alcista (Precio > EMA200)
+    # 2. Toque de Banda de Bollinger 3.0 (Pánico extremo)
+    # 3. RSI < 15 (Sobreventa total)
+    # 4. VOLUMEN alto (Capitulación)
+    # 5. MECHA de rechazo (Absorción)
     if curr["close"] > curr["ema200"]:
-        if curr["low"] < curr["lower"] and curr["rsi"] < 18:
-            if lower_wick > (body * 2):
-                side, prob = "BUY", 92.0
-                entry = curr["close"]
-                tp, sl = entry * 1.008, entry * 0.980
+        if curr["low"] < curr["lower"] and curr["rsi"] < 15:
+            if curr["volume"] > (curr["vol_avg"] * 1.5): # Volumen 50% mayor al promedio
+                if lower_wick > (body * 2.5): # Mecha dominante
+                    side, prob = "BUY", 95.0
+                    entry = curr["close"]
+                    tp, sl = entry * 1.008, entry * 0.985 # Ajustamos SL a 1.5%
 
+    # --- ESTRATEGIA SNIPER SHORT ---
     elif curr["close"] < curr["ema200"]:
-        if curr["high"] > curr["upper"] and curr["rsi"] > 82:
-            if upper_wick > (body * 2):
-                side, prob = "SELL", 92.0
-                entry = curr["close"]
-                tp, sl = entry * 0.992, entry * 1.020
+        if curr["high"] > curr["upper"] and curr["rsi"] > 85:
+            if curr["volume"] > (curr["vol_avg"] * 1.5):
+                if upper_wick > (body * 2.5):
+                    side, prob = "SELL", 95.0
+                    entry = curr["close"]
+                    tp, sl = entry * 0.992, entry * 1.015 # Ajustamos SL a 1.5%
 
     if side:
         return Signal(side=side, entry=entry, sl=sl, tp=tp, probability=prob,
-                      trigger="ULTRA_PRECISION", reason="Trend+Extremes+WickRejection",
+                      trigger="SNIPER_V3", reason="ExtremeVol+Wick+BB3",
                       timestamp_ms=int(curr["timestamp"].timestamp() * 1000))
     return None
 
